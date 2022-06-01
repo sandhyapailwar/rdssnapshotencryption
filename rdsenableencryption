@@ -1,0 +1,239 @@
+'''
+This lambda function encrypts the RDS instance to provide an additional layer of data protection from unauthorized access to the underlying storage.
+STEP 1: Detect if encryption is enabled or not. If not, triggers further rememdiation steps.
+'''
+
+# standard imports
+import json
+import logging
+import os
+import sys
+import re
+import datetime
+from datetime import datetime
+from time import sleep
+
+import boto3
+from botocore.exceptions import ClientError
+from src.helpers import tagHelperRds
+
+# custom imports
+import utils
+import eventHandler
+import logUtils  # wrapper file for logging
+import customErrors  # Used for raising custom errors
+from src.config import config  # Hard coded strings are stored in config
+MODULE_NAME = __file__
+
+def parseEvent(event, context):
+    '''This function extracts information captured in event and sends the information to function
+        doHandleEvent'''
+    print(event)
+    logUtils.logInfo(MODULE_NAME, "Inside " + parseEvent.__name__)
+    logUtils.logInfo(MODULE_NAME,event)
+    try:
+        dbInstanceIdentifier = event['detail']['requestParameters']['dBInstanceIdentifier']
+        accountId = event['detail']['userIdentity']['accountId']
+        accountArn = event['detail']['userIdentity']['arn']
+        
+        if config.ROLES['lambdaRole'] in accountArn or config.ROLES['targetManagementRole'] in accountArn:
+            if event['detail']['eventName'] not in ['dbInstanceIdentifier']:
+                logUtils.logInfo(MODULE_NAME, "Event triggered by CSAO, ignoring...")
+                return 
+        awsRegion = event['detail']['awsRegion']
+        userEmail = utils.getEmailFromArn(accountArn)
+        ruleName = config.RULE_NAMES['rdsEnableEncryption']
+        service = config.SERVICE_NAME['RDS']
+        tags = tagHelperRds.getTags(service, accountId, awsRegion, dbInstanceIdentifier)
+        
+        doHandleEvent(ruleName, accountId, awsRegion, userEmail, service, dbInstanceIdentifier, event, tags)
+
+    except Exception as e:
+        if hasattr(e, 'error') and hasattr(e, 'errorMessage'):
+            error = e
+        else:
+            error = customErrors.GenericError(config.GENERIC_ERROR_STATUS_CODE, config.GENERIC_ERROR_MESSAGE, str(e))
+        logUtils.logError(MODULE_NAME, e)
+
+def doHandleEvent(ruleName, accountId, awsRegion, userEmail, service, dbInstanceIdentifier, event, tag):
+    '''This function calls the class with arguments extracted from event which assume role, extract information
+       from db and decide whether the remediation to be performed or not '''
+    try:
+        handler = CSAOEventHandlerAWSRDSEncryption(
+            ruleName, accountId, awsRegion, userEmail, service, dbInstanceIdentifier, event, tag)
+        return handler.handleEvent()
+
+    except Exception as e:
+        if hasattr(e, 'error') and hasattr(e, 'errorMessage'):
+            error = e
+        else:
+            error = customErrors.GenericError(
+                config.GENERIC_ERROR_STATUS_CODE, config.GENERIC_ERROR_MESSAGE, str(e))
+        logUtils.logError(MODULE_NAME, error)
+
+
+class CSAOEventHandlerAWSRDSEncryption(eventHandler.CSAOEventHandlerAWSService):
+
+    # This function determines whether rule is violated (i.e. is the instance encrypted)
+    def isRuleViolated(self):
+        
+        try:
+            logUtils.logInfo(MODULE_NAME, "Inside " +
+                             self.isRuleViolated.__name__)
+                             
+            #response = self.client.describe_db_instances()
+            #IsEncrypted=response['DBInstances']
+            #Variable2=IsEncrypted['StorageEncrypted']
+             #if self.response == IsEncrypted(['DBInstanceIdentifier']):
+                #if Variable2 == True:
+                    #return True
+                #else:
+                    #return False
+            
+            encrypted = self.eventLog['detail']['responseElements']['storageEncrypted']
+            if encrypted:
+                logUtils.logInfo(MODULE_NAME, 'Will not remediate')
+                return False
+            else:
+                return True
+
+        except Exception as e:
+            if hasattr(e, 'error') and hasattr(e, 'errorMessage'):
+                error = e
+            else:
+                error = customErrors.GenericError(
+                    config.GENERIC_ERROR_STATUS_CODE, config.GENERIC_ERROR_MESSAGE, str(e))
+            logUtils.logError(MODULE_NAME, error)
+        return False
+
+    '''This function waits for the instance to be available and puts an event on CSAOEvents Bus for further remediation steps '''
+
+    def remediate(self):
+
+        try:
+            print("Inside remediate bl")
+            logUtils.logInfo(MODULE_NAME, "Inside " + self.remediate.__name__)
+            dbInstanceIdentifier = self.eventLog['detail']['requestParameters']['dBInstanceIdentifier']
+            #dbSnapshotIdentifier = dbInstanceIdentifier + "-snapshot-old"
+            accountId = self.eventLog['detail']['userIdentity']['accountId']
+            awsRegion = self.eventLog['detail']['awsRegion']
+            dbSnapshotIdentifier = dbInstanceIdentifier + \
+                'snapshot'  # event['detail']['dbSnapshotIdentifier']
+            rdsClient = utils.getAwsClient('rds', accountId, awsRegion)
+            
+            #newDBSnapshotIdentifier = dbInstanceIdentifier + "-snapshot-new"
+            waiter = self.client.get_waiter('db_instance_available')
+            waiter.wait(
+                DBInstanceIdentifier=dbInstanceIdentifier,
+                WaiterConfig={
+                    'Delay': 60,
+                    'MaxAttempts': 30
+                }
+            )
+         
+            logUtils.logInfo(
+                MODULE_NAME, 'Creating  snapshot')
+            rdsClient.create_db_snapshot(
+                DBSnapshotIdentifier=dbInstanceIdentifier,
+                DBInstanceIdentifier=dbInstanceIdentifier,
+                );
+                
+            waiter = self.client.get_waiter('db_snapshot_available')
+            waiter.wait(
+                DBSnapshotIdentifier=dbInstanceIdentifier,
+                WaiterConfig={
+                    'Delay': 60,
+                    'MaxAttempts': 30
+                }
+            )         
+            
+            newDBSnapshotIdentifier = dbInstanceIdentifier + "-snapshot-new"
+            logUtils.logInfo(
+                MODULE_NAME, 'Copy  encrypted snapshot')
+            rdsClient.copy_db_snapshot(
+                SourceDBSnapshotIdentifier=dbInstanceIdentifier,
+                TargetDBSnapshotIdentifier=newDBSnapshotIdentifier,
+                KmsKeyId='alias/aws/rds'
+                );
+                
+            waiter = self.client.get_waiter('db_snapshot_available')
+            waiter.wait(
+                DBSnapshotIdentifier=dbInstanceIdentifier,
+                WaiterConfig={
+                    'Delay': 60,
+                    'MaxAttempts': 30
+                }
+            )    
+            
+            #sleep(120)
+            
+            logUtils.logInfo(
+                MODULE_NAME, 'Delete old instance')
+            rdsClient.delete_db_instance(
+                DBInstanceIdentifier=dbInstanceIdentifier,
+                SkipFinalSnapshot=True,
+                DeleteAutomatedBackups=True
+                );
+            logUtils.logInfo(
+                MODULE_NAME, 'deletion of the db is sucessful.......')
+                
+            #sleep (30)
+           
+            DBSnapshotIdentifier=newDBSnapshotIdentifier
+            logUtils.logInfo(
+                MODULE_NAME, 'Creating new instance from encrypted snapshot')
+            rdsClient.restore_db_instance_from_db_snapshot(
+                DBInstanceIdentifier=DBSnapshotIdentifier,
+                DBSnapshotIdentifier=newDBSnapshotIdentifier,
+                DBSubnetGroupName='default-vpc-03b02b1790f99d8e3'
+            ); 
+            
+            logUtils.logInfo(
+                MODULE_NAME, 'Successfully created a new instance')
+
+            
+            '''
+            logUtils.logInfo(
+                MODULE_NAME, 'Creating new instance from encrypted snapshot')
+                
+            rdsClient.create_db_instance_from_snapshot(
+                DBInstanceIdentifier=dbInstanceIdentifier,
+                DBSnapshotIdentifier=newDBSnapshotIdentifier
+            );
+            logUtils.logInfo(
+                MODULE_NAME, 'Successfully created a new instance')
+            waiter = rdsClient.get_waiter('db_instance_available')
+
+            waiter.wait(
+                DBInstanceIdentifier=dbInstanceIdentifier
+            )
+            logUtils.logInfo(MODULE_NAME, 'deleting encrypted snapshot')
+            rdsClient.delete_db_snapshot(
+                DBSnapshotIdentifier=newDBSnapshotIdentifier
+            )
+            logUtils.logInfo(
+                MODULE_NAME, 'deletion of the snapshot is sucessful.......')
+            logUtils.logInfo(
+                MODULE_NAME, "Remediation performed successfully...")
+            '''
+           
+        except Exception as e:
+            logUtils.logError(MODULE_NAME, e)
+            if self.retryAttempts <= 0:
+                logUtils.logInfo(
+                    MODULE_NAME, "Remediation NOT performed, maximum retry attempts done! EXITING")
+            else:
+                logUtils.logInfo(
+                    MODULE_NAME, "Remediation not performed, retrying in 20s ..")
+                sleep(20)
+                self.retryAttempts = self.retryAttempts - 1
+                self.remediate()
+
+    def getEventCustomPayload(self):
+        try:
+            customEventInfo = {
+                'remediationStatus': 'Started'
+            }
+            return customEventInfo
+        except Exception as e:
+            logUtils.logError(MODULE_NAME, e)
